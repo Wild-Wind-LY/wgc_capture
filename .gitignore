@@ -1,0 +1,8 @@
+/build/*
+.cache
+.vscode
+../.vscode/
+/download/*
+/third_party/*
+/lib/*
+/test/*
