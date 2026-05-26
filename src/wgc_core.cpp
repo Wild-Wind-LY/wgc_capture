@@ -3,13 +3,14 @@
 #include <dwmapi.h>
 #include <winrt/base.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
 
-#include "BS_thread_pool.hpp"
 #include "gpu_encoder.hpp"
 #define QOI_IMPLEMENTATION
 #include "qoi.h"
@@ -17,8 +18,7 @@
 
 static bool IsWindowsGraphicsCaptureSupported() {
   try {
-    return winrt::Windows::Graphics::Capture::GraphicsCaptureSession::
-        IsSupported();
+    return winrt::Windows::Graphics::Capture::GraphicsCaptureSession::IsSupported();
   } catch (...) {
     return false;
   }
@@ -27,13 +27,11 @@ static bool IsWindowsGraphicsCaptureSupported() {
 static std::string hstr2str(const winrt::hstring& hstr) {
   const wchar_t* wstr = hstr.c_str();
   int wlen = static_cast<int>(wcslen(wstr));
-  int len =
-      WideCharToMultiByte(CP_UTF8, 0, wstr, wlen, nullptr, 0, nullptr, nullptr);
+  int len = WideCharToMultiByte(CP_UTF8, 0, wstr, wlen, nullptr, 0, nullptr, nullptr);
   if (len == 0) return {};
 
   std::string result(len, 0);
-  WideCharToMultiByte(CP_UTF8, 0, wstr, wlen, result.data(), len, nullptr,
-                      nullptr);
+  WideCharToMultiByte(CP_UTF8, 0, wstr, wlen, result.data(), len, nullptr, nullptr);
   return result;
 }
 
@@ -42,15 +40,13 @@ std::string WgcCore::GetWindowsVersionString() {
 
   HMODULE hMod = ::GetModuleHandleW(L"ntdll.dll");
   if (hMod) {
-    auto rtlGetVersion = reinterpret_cast<RtlGetVersionPtr>(
-        GetProcAddress(hMod, "RtlGetVersion"));
+    auto rtlGetVersion = reinterpret_cast<RtlGetVersionPtr>(GetProcAddress(hMod, "RtlGetVersion"));
     if (rtlGetVersion) {
       OSVERSIONINFOEXW osInfo = {};
       osInfo.dwOSVersionInfoSize = sizeof(osInfo);
       if (rtlGetVersion(reinterpret_cast<PRTL_OSVERSIONINFOW>(&osInfo)) == 0) {
         std::ostringstream oss;
-        oss << osInfo.dwMajorVersion << "." << osInfo.dwMinorVersion << "."
-            << osInfo.dwBuildNumber;
+        oss << osInfo.dwMajorVersion << "." << osInfo.dwMinorVersion << "." << osInfo.dwBuildNumber;
         return oss.str();
       }
     }
@@ -58,15 +54,9 @@ std::string WgcCore::GetWindowsVersionString() {
   return "Unknown";
 }
 
-namespace MyThreadPool {
-static BS::thread_pool<BS::tp::none> threadPool{
-    std::thread::hardware_concurrency()};
-}
-
 WgcCore::WgcCore() {
   if (!IsWindowsGraphicsCaptureSupported()) {
-    throw std::runtime_error(
-        "Windows Graphics Capture not supported on this OS version.");
+    throw std::runtime_error("Windows Graphics Capture not supported on this OS version.");
   }
   // SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -92,9 +82,8 @@ WgcCore::WgcCore() {
       RawFrameData rawFrame{};
       {
         std::unique_lock lock(m_rawQueueMutex);
-        m_rawQueueCV.wait(lock, [&]() {
-          return !m_rawFrameQueue.empty() || !m_encodingThreadRunning;
-        });
+        m_rawQueueCV.wait(lock,
+                          [&]() { return !m_rawFrameQueue.empty() || !m_encodingThreadRunning; });
         if (!m_encodingThreadRunning) break;
 
         if (!m_rawFrameQueue.pop(rawFrame)) {
@@ -132,68 +121,56 @@ WgcCore::WgcCore() {
       // 线程局部变量，线程安全独立缓存
       thread_local StagingTextureCache stagingCache;
 
-      // 提交异步编码任务
-      MyThreadPool::threadPool.detach_task(
-          [this, rawFrame = std::move(rawFrame)]() mutable {
-            auto* stagingTex =
-                stagingCache.GetOrCreate(rawFrame.desc, m_d3dDevice.get());
+      // Keep the immediate context on one worker thread during GPU readback.
+      auto* stagingTex = stagingCache.GetOrCreate(rawFrame.desc, m_d3dDevice.get());
 
-            m_d3dContext->CopyResource(stagingTex, rawFrame.texture.get());
+      m_d3dContext->CopyResource(stagingTex, rawFrame.texture.get());
 
-            D3D11_MAPPED_SUBRESOURCE mapped{};
-            HRESULT hr =
-                m_d3dContext->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped);
-            if (FAILED(hr)) return;
+      D3D11_MAPPED_SUBRESOURCE mapped{};
+      HRESULT hr = m_d3dContext->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped);
+      if (FAILED(hr)) continue;
 
-            // 复制数据
-            std::vector<uint8_t> rgbaData;
-            rgbaData.resize(rawFrame.desc.Width * rawFrame.desc.Height * 4);
-            const uint32_t expectedPitch = rawFrame.desc.Width * 4;
-            if (mapped.RowPitch == expectedPitch) {
-              std::memcpy(rgbaData.data(), mapped.pData,
-                          rawFrame.desc.Height * expectedPitch);
-            } else {
-              for (uint32_t y = 0; y < rawFrame.desc.Height; ++y) {
-                const uint8_t* src =
-                    reinterpret_cast<const uint8_t*>(mapped.pData) +
-                    y * mapped.RowPitch;
-                uint8_t* dst = rgbaData.data() + y * expectedPitch;
-                std::memcpy(dst, src, expectedPitch);
-              }
-            }
+      std::vector<uint8_t> rgbaData;
+      rgbaData.resize(rawFrame.desc.Width * rawFrame.desc.Height * 4);
+      const uint32_t expectedPitch = rawFrame.desc.Width * 4;
+      if (mapped.RowPitch == expectedPitch) {
+        std::memcpy(rgbaData.data(), mapped.pData, rawFrame.desc.Height * expectedPitch);
+      } else {
+        for (uint32_t y = 0; y < rawFrame.desc.Height; ++y) {
+          const uint8_t* src = reinterpret_cast<const uint8_t*>(mapped.pData) + y * mapped.RowPitch;
+          uint8_t* dst = rgbaData.data() + y * expectedPitch;
+          std::memcpy(dst, src, expectedPitch);
+        }
+      }
 
-            m_d3dContext->Unmap(stagingTex, 0);
+      m_d3dContext->Unmap(stagingTex, 0);
+      m_readbackFrames.fetch_add(1, std::memory_order_relaxed);
 
 #if 0
-            std::vector<uint8_t> qoiBuffer{};
-            if (!EncodeQoiToBuffer(rgbaData.data(), rawFrame.desc, qoiBuffer)) {
-              std::cout << "Async qoi encoding failed." << std::endl;
-            } else {
-              // std::lock_guard<std::mutex> lock(m_encodingMutex);
-              // if (m_encodedQueue.size() > kMaxEncodingQueueSize) {
-              //   m_encodedQueue.pop();
-              // }
-              // m_encodedQueue.emplace(EncodedFrame{
-              //     rawFrame.frameIndex,
-              //     std::move(qoiBuffer),
-              // });
-              m_encodedQueue.push(
-                  {rawFrame.frameIndex, rawFrame.desc, std::move(qoiBuffer)});
-            }
+      std::vector<uint8_t> qoiBuffer{};
+      if (!EncodeQoiToBuffer(rgbaData.data(), rawFrame.desc, qoiBuffer)) {
+        std::cout << "Async qoi encoding failed." << std::endl;
+      } else {
+        std::lock_guard<std::mutex> lock(m_encodingMutex);
+        if (m_encodedFrame) {
+          m_outputDroppedFrames.fetch_add(1, std::memory_order_relaxed);
+        }
+        m_encodedFrame =
+            EncodedFrame{rawFrame.frameIndex, rawFrame.desc, std::move(qoiBuffer)};
+      }
 #else
-            std::vector<uint8_t> rawBuffer{};
-            rawBuffer = std::move(rgbaData);  // 直接拿到 CPU 内存里的 RGBA 数据
-            if (rawBuffer.empty()) {
-              std::cout << "Async raw frame copy failed." << std::endl;
-            } else {
-              if (m_encodedQueue.size() <= kMaxEncodingQueueSize) {
-                std::lock_guard<std::mutex> lock(m_encodingMutex);
-                m_encodedQueue.push(
-                    {rawFrame.frameIndex, rawFrame.desc, std::move(rawBuffer)});
-              }
-            }
+      std::vector<uint8_t> rawBuffer{};
+      rawBuffer = std::move(rgbaData);  // 直接拿到 CPU 内存里的 RGBA 数据
+      if (rawBuffer.empty()) {
+        std::cout << "Async raw frame copy failed." << std::endl;
+      } else {
+        std::lock_guard<std::mutex> lock(m_encodingMutex);
+        if (m_encodedFrame) {
+          m_outputDroppedFrames.fetch_add(1, std::memory_order_relaxed);
+        }
+        m_encodedFrame = EncodedFrame{rawFrame.frameIndex, rawFrame.desc, std::move(rawBuffer)};
+      }
 #endif
-          });
     }
   });
 }
@@ -210,8 +187,8 @@ WgcCore::~WgcCore() {
   m_item = nullptr;
 
   // 停止编码线程
-  m_rawQueueCV.notify_all();
   m_encodingThreadRunning = false;
+  m_rawQueueCV.notify_all();
   if (m_encodingThread.joinable()) {
     m_encodingThread.join();
   }
@@ -225,15 +202,14 @@ void WgcCore::CreateDevice() {
   flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
 
-  D3D_FEATURE_LEVEL featureLevels[] = {
-      D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
-      D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3};
+  D3D_FEATURE_LEVEL featureLevels[]
+      = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
+         D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3};
 
   D3D_FEATURE_LEVEL featureLevel;
 
-  HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                                 flags, featureLevels, ARRAYSIZE(featureLevels),
-                                 D3D11_SDK_VERSION, m_d3dDevice.put(),
+  HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, featureLevels,
+                                 ARRAYSIZE(featureLevels), D3D11_SDK_VERSION, m_d3dDevice.put(),
                                  &featureLevel, m_d3dContext.put());
   CHECK_HR(hr, "Failed to create D3D11 device.");
 
@@ -242,34 +218,29 @@ void WgcCore::CreateDevice() {
 
   // 由 dxgiDevice 创建 WinRT Direct3DDevice
   winrt::com_ptr<::IInspectable> inspectableDevice;
-  hr = CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.get(),
-                                            inspectableDevice.put());
-  if (FAILED(hr))
-    throw std::runtime_error("CreateDirect3D11DeviceFromDXGIDevice failed");
+  hr = CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.get(), inspectableDevice.put());
+  if (FAILED(hr)) throw std::runtime_error("CreateDirect3D11DeviceFromDXGIDevice failed");
 
   // 转为 IDirect3DDevice
-  m_winrtDevice =
-      inspectableDevice
-          .as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
+  m_winrtDevice
+      = inspectableDevice.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
 }
 
 void WgcCore::CreateCaptureItem(HWND hwnd) {
   if (!hwnd) throw std::invalid_argument("Invalid HWND.");
 
-  auto factory = winrt::get_activation_factory<
-      winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
-      IGraphicsCaptureItemInterop>();
+  auto factory
+      = winrt::get_activation_factory<winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
+                                      IGraphicsCaptureItemInterop>();
 
   if (!factory) {
-    throw std::runtime_error(
-        "Failed to get IGraphicsCaptureItemInterop factory.");
+    throw std::runtime_error("Failed to get IGraphicsCaptureItemInterop factory.");
   }
 
   // 引入ABI命名空间别名，部分项目中需使用
   using namespace ABI::Windows::Graphics::Capture;
-  HRESULT hr = factory->CreateForWindow(
-      hwnd, __uuidof(IGraphicsCaptureItem),
-      reinterpret_cast<void**>(winrt::put_abi(m_item)));
+  HRESULT hr = factory->CreateForWindow(hwnd, __uuidof(IGraphicsCaptureItem),
+                                        reinterpret_cast<void**>(winrt::put_abi(m_item)));
   CHECK_HR(hr, "Failed to create capture item.");
 
   if (!m_item) {
@@ -280,20 +251,18 @@ void WgcCore::CreateCaptureItem(HWND hwnd) {
 void WgcCore::CreateCaptureItem(HMONITOR hmonitor) {
   if (!hmonitor) throw std::invalid_argument("Invalid hmonitor.");
 
-  auto factory = winrt::get_activation_factory<
-      winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
-      IGraphicsCaptureItemInterop>();
+  auto factory
+      = winrt::get_activation_factory<winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
+                                      IGraphicsCaptureItemInterop>();
 
   if (!factory) {
-    throw std::runtime_error(
-        "Failed to get IGraphicsCaptureItemInterop factory.");
+    throw std::runtime_error("Failed to get IGraphicsCaptureItemInterop factory.");
   }
 
   // 引入ABI命名空间别名，部分项目中需使用
   using namespace ABI::Windows::Graphics::Capture;
-  HRESULT hr = factory->CreateForMonitor(
-      hmonitor, __uuidof(IGraphicsCaptureItem),
-      reinterpret_cast<void**>(winrt::put_abi(m_item)));
+  HRESULT hr = factory->CreateForMonitor(hmonitor, __uuidof(IGraphicsCaptureItem),
+                                         reinterpret_cast<void**>(winrt::put_abi(m_item)));
   CHECK_HR(hr, "Failed to create capture item.");
 
   if (!m_item) {
@@ -314,8 +283,7 @@ void WgcCore::CreateCaptureItem(HMONITOR hmonitor) {
 bool WgcCore::IsWindowCapturable(HWND hwnd) {
   if (!::IsWindow(hwnd)) return false;
   BOOL cloaked = FALSE;
-  if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked,
-                                      sizeof(cloaked)))) {
+  if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked)))) {
     if (cloaked) return false;
   }
   if (::IsIconic(hwnd)) return false;
@@ -331,16 +299,14 @@ bool WgcCore::CheckWgcSupported() {
 #endif
 
 #if defined(PROJECT_SDK_MAJOR) && defined(PROJECT_SDK_BUILD)
-  constexpr bool sdk_supports_win10_build =
-      (PROJECT_SDK_MAJOR > 10) ||
-      (PROJECT_SDK_MAJOR == 10 && PROJECT_SDK_BUILD >= 19041);
+  constexpr bool sdk_supports_win10_build
+      = (PROJECT_SDK_MAJOR > 10) || (PROJECT_SDK_MAJOR == 10 && PROJECT_SDK_BUILD >= 19041);
 #else
   constexpr bool sdk_supports_win10_build = true;  // 默认通过
 #endif
 
   if (!sdk_supports_win10) {
-    std::cerr << "WGC not supported: SDK does not target Windows 10."
-              << std::endl;
+    std::cerr << "WGC not supported: SDK does not target Windows 10." << std::endl;
     return false;
   }
   if (!sdk_supports_win10_build) {
@@ -371,8 +337,8 @@ void WgcCore::CheckVideoFormatSupport() const {
     D3D11_FEATURE_DATA_FORMAT_SUPPORT support1 = {fmt.format};
     D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support2 = {fmt.format};
 
-    bool hasSupport1 = SUCCEEDED(m_d3dDevice->CheckFeatureSupport(
-        D3D11_FEATURE_FORMAT_SUPPORT, &support1, sizeof(support1)));
+    bool hasSupport1 = SUCCEEDED(m_d3dDevice->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT,
+                                                                  &support1, sizeof(support1)));
 
     std::cout << fmt.name << ":\n";
 
@@ -385,11 +351,9 @@ void WgcCore::CheckVideoFormatSupport() const {
       std::cout << "  - Texture2D Supported\n";
     if ((support1.OutFormatSupport & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) != 0)
       std::cout << "  - Shader Sample Supported\n";
-    if ((support1.OutFormatSupport &
-         D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT) != 0)
+    if ((support1.OutFormatSupport & D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT) != 0)
       std::cout << "  - Video Processor Output Supported\n";
-    if ((support1.OutFormatSupport &
-         D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT) != 0)
+    if ((support1.OutFormatSupport & D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT) != 0)
       std::cout << "  - Video Processor Input Supported\n";
     if ((support1.OutFormatSupport & D3D11_FORMAT_SUPPORT_VIDEO_ENCODER) != 0)
       std::cout << "  - Video Encoder Supported\n";
@@ -412,11 +376,10 @@ bool WgcCore::Initialize(uintptr_t h_val, CaptureType type) {
         }
         // 创建 DispatcherQueueController 保证事件回调能触发
         if (!m_dispatcherQueueController) {
-          m_dispatcherQueueController = winrt::Windows::System::
-              DispatcherQueueController::CreateOnDedicatedThread();
+          m_dispatcherQueueController
+              = winrt::Windows::System::DispatcherQueueController::CreateOnDedicatedThread();
           if (!m_dispatcherQueueController) {
-            std::cerr << "Failed to create DispatcherQueueController."
-                      << std::endl;
+            std::cerr << "Failed to create DispatcherQueueController." << std::endl;
             return false;
           }
         }
@@ -425,16 +388,16 @@ bool WgcCore::Initialize(uintptr_t h_val, CaptureType type) {
         m_lastSize = m_item.Size();
 
         // 增加帧池大小，从1增加到2以提高帧缓存和性能
-        m_framePool = winrt::Windows::Graphics::Capture::
-            Direct3D11CaptureFramePool::CreateFreeThreaded(
+        m_framePool
+            = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
                 m_winrtDevice,
                 winrt::Windows::Graphics::DirectX::
                     //  DirectXPixelFormat::B8G8R8A8UIntNormalized,
                 DirectXPixelFormat::R8G8B8A8UIntNormalized,
                 2, m_lastSize);
 
-        m_frameArrivedRevoker = m_framePool.FrameArrived(
-            winrt::auto_revoke, {this, &WgcCore::OnFrameArrived});
+        m_frameArrivedRevoker
+            = m_framePool.FrameArrived(winrt::auto_revoke, {this, &WgcCore::OnFrameArrived});
 
         m_session = m_framePool.CreateCaptureSession(m_item);
         m_session.IsCursorCaptureEnabled(false);
@@ -455,11 +418,10 @@ bool WgcCore::Initialize(uintptr_t h_val, CaptureType type) {
 
         // 创建 DispatcherQueueController 保证事件回调能触发
         if (!m_dispatcherQueueController) {
-          m_dispatcherQueueController = winrt::Windows::System::
-              DispatcherQueueController::CreateOnDedicatedThread();
+          m_dispatcherQueueController
+              = winrt::Windows::System::DispatcherQueueController::CreateOnDedicatedThread();
           if (!m_dispatcherQueueController) {
-            std::cerr << "Failed to create DispatcherQueueController."
-                      << std::endl;
+            std::cerr << "Failed to create DispatcherQueueController." << std::endl;
             return false;
           }
         }
@@ -467,16 +429,16 @@ bool WgcCore::Initialize(uintptr_t h_val, CaptureType type) {
         m_lastSize = m_item.Size();
 
         // 增加帧池大小，从1增加到2以提高帧缓存和性能
-        m_framePool = winrt::Windows::Graphics::Capture::
-            Direct3D11CaptureFramePool::CreateFreeThreaded(
+        m_framePool
+            = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
                 m_winrtDevice,
                 winrt::Windows::Graphics::DirectX::
                     //  DirectXPixelFormat::B8G8R8A8UIntNormalized,
                 DirectXPixelFormat::R8G8B8A8UIntNormalized,
                 2, m_lastSize);
 
-        m_frameArrivedRevoker = m_framePool.FrameArrived(
-            winrt::auto_revoke, {this, &WgcCore::OnFrameArrived});
+        m_frameArrivedRevoker
+            = m_framePool.FrameArrived(winrt::auto_revoke, {this, &WgcCore::OnFrameArrived});
 
         m_session = m_framePool.CreateCaptureSession(m_item);
         m_session.IsCursorCaptureEnabled(false);
@@ -527,18 +489,42 @@ void WgcCore::Stop() {
 
 auto WgcCore::GetEncodedFrame() -> std::optional<EncodedFrame> {
   std::unique_lock lock(m_encodingMutex);
-  if (m_encodedQueue.empty()) return std::nullopt;
+  if (!m_encodedFrame) return std::nullopt;
 
-  EncodedFrame frame{};
-  // m_encodedQueue.pop(frame);
-  frame = m_encodedQueue.top();
-  m_encodedQueue.pop();
+  EncodedFrame frame = std::move(*m_encodedFrame);
+  m_encodedFrame.reset();
 
   return frame;
 }
 
-auto WgcCore::DecodeQoiToFrame(const EncodedFrame& frame)
-    -> std::optional<FrameData> {
+CaptureStats WgcCore::GetStats() {
+  std::vector<double> intervals;
+  {
+    std::lock_guard<std::mutex> lock(m_captureTimingMutex);
+    intervals.swap(m_captureIntervalsMs);
+  }
+
+  CaptureStats stats{
+      m_capturedFrames.load(std::memory_order_relaxed),
+      m_duplicateFrames.load(std::memory_order_relaxed),
+      m_readbackFrames.load(std::memory_order_relaxed),
+      m_rawDroppedFrames.load(std::memory_order_relaxed),
+      m_outputDroppedFrames.load(std::memory_order_relaxed),
+  };
+
+  if (!intervals.empty()) {
+    std::sort(intervals.begin(), intervals.end());
+    const size_t p95Index =
+        static_cast<size_t>(std::ceil(intervals.size() * 0.95)) - 1;
+    stats.captureIntervalMaxMs = intervals.back();
+    stats.captureIntervalP95Ms = intervals[p95Index];
+    stats.captureIntervalSamples = intervals.size();
+  }
+
+  return stats;
+}
+
+auto WgcCore::DecodeQoiToFrame(const EncodedFrame& frame) -> std::optional<FrameData> {
   qoi_desc desc{};
   // 4 表示 RGBA
   void* decoded = qoi_decode(frame.data.data(), frame.data.size(), &desc, 4);
@@ -546,8 +532,7 @@ auto WgcCore::DecodeQoiToFrame(const EncodedFrame& frame)
     return std::nullopt;
   }
 
-  size_t dataSize =
-      static_cast<size_t>(desc.width) * desc.height * desc.channels;
+  size_t dataSize = static_cast<size_t>(desc.width) * desc.height * desc.channels;
   std::vector<uint8_t> rgbaData(dataSize);
   std::memcpy(rgbaData.data(), decoded, dataSize);
   free(decoded);
@@ -572,6 +557,24 @@ void WgcCore::OnFrameArrived(
     while (auto frame = m_framePool.TryGetNextFrame()) {
       if (!frame) return;
 
+      const auto captureTimestamp = frame.SystemRelativeTime();
+      {
+        std::lock_guard<std::mutex> lock(m_captureTimingMutex);
+        if (m_lastCaptureTimestamp.count() != 0 &&
+            captureTimestamp == m_lastCaptureTimestamp) {
+          m_duplicateFrames.fetch_add(1, std::memory_order_relaxed);
+          continue;
+        }
+        if (m_lastCaptureTimestamp.count() != 0) {
+          m_captureIntervalsMs.push_back(
+              std::chrono::duration<double, std::milli>(
+                  captureTimestamp - m_lastCaptureTimestamp)
+                  .count());
+        }
+        m_lastCaptureTimestamp = captureTimestamp;
+      }
+      m_capturedFrames.fetch_add(1, std::memory_order_relaxed);
+
       auto size = frame.ContentSize();
 
       // UINT evenWidth = size.Width & ~15;
@@ -580,8 +583,7 @@ void WgcCore::OnFrameArrived(
       // bool sizeChanged =
       //     (evenWidth != m_lastSize.Width) || (evenHeight !=
       //     m_lastSize.Height);
-      bool sizeChanged = (size.Width != m_lastSize.Width) ||
-                         (size.Height != m_lastSize.Height);
+      bool sizeChanged = (size.Width != m_lastSize.Width) || (size.Height != m_lastSize.Height);
 
       if (sizeChanged) {
         newSize = true;
@@ -644,14 +646,14 @@ void WgcCore::OnFrameArrived(
       if (m_rawFrameQueue.push({m_frameIndex++, desc, frameTexture})) {
         m_rawQueueCV.notify_one();
       } else {
-        // std::cout << "Queue full, drop frame.\n";
+        m_rawDroppedFrames.fetch_add(1, std::memory_order_relaxed);
       }
 
       if (newSize) {
-        m_framePool.Recreate(m_winrtDevice,
-                             winrt::Windows::Graphics::DirectX::
-                                 DirectXPixelFormat::R8G8B8A8UIntNormalized,
-                             2, m_lastSize);
+        m_framePool.Recreate(
+            m_winrtDevice,
+            winrt::Windows::Graphics::DirectX::DirectXPixelFormat::R8G8B8A8UIntNormalized, 2,
+            m_lastSize);
       }
     }
 
@@ -726,8 +728,7 @@ bool WgcCore::EncodePngToBuffer(uint8_t* rgbaData, uint32_t width,
 }
 #endif
 
-bool WgcCore::EncodeQoiToBuffer(uint8_t* rgbaData,
-                                const D3D11_TEXTURE2D_DESC& texDesc,
+bool WgcCore::EncodeQoiToBuffer(uint8_t* rgbaData, const D3D11_TEXTURE2D_DESC& texDesc,
                                 std::vector<uint8_t>& outQoi) {
   qoi_desc desc;
   desc.width = texDesc.Width;
@@ -746,8 +747,7 @@ bool WgcCore::EncodeQoiToBuffer(uint8_t* rgbaData,
     return false;
   }
 
-  std::unique_ptr<uint8_t, decltype(&free)> qoiData(
-      static_cast<uint8_t*>(qoiDataRaw), &free);
+  std::unique_ptr<uint8_t, decltype(&free)> qoiData(static_cast<uint8_t*>(qoiDataRaw), &free);
 
   outQoi.assign(qoiData.get(), qoiData.get() + outLen);
   return true;
@@ -897,8 +897,8 @@ void dpi_helper::EnablePerMonitorV2DpiAwareness() {
   }
 
   // 最后再试 Windows Vista 的 SetProcessDPIAware
-  auto set_dpi_aware = reinterpret_cast<BOOL(WINAPI*)(void)>(
-      GetProcAddress(user32, "SetProcessDPIAware"));
+  auto set_dpi_aware
+      = reinterpret_cast<BOOL(WINAPI*)(void)>(GetProcAddress(user32, "SetProcessDPIAware"));
   if (set_dpi_aware && set_dpi_aware()) {
     std::cout << "[DPI] Enabled System DPI awareness (legacy)\n";
   } else {

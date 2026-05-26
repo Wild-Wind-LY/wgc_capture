@@ -9,7 +9,9 @@
  *
  */
 
+#include <chrono>
 #include <iostream>
+#include <thread>
 
 #include "fps_counter.hpp"
 #include "frame_renderer.hpp"
@@ -37,6 +39,8 @@ int main() {
     std::cout << "选中区域: " << r.left << "," << r.top << " - " << r.right << "," << r.bottom
               << "\n";
   }
+
+  dpi_helper::EnablePerMonitorV2DpiAwareness();
 
 #if 0  // 测试屏幕捕获
   MonitorSelector selector;
@@ -78,6 +82,8 @@ int main() {
     std::cout << "无效选择" << std::endl;
     return 0;
   }
+  std::cout << std::dec;
+
 #endif
 
   try {
@@ -91,14 +97,40 @@ int main() {
     capturer.Start();
 
     FrameRenderer renderer("WGC Preview", 120);
+    auto statsTime = std::chrono::steady_clock::now();
+    CaptureStats previousStats{};
 
     while (renderer.Run()) {
       auto bufOpt = capturer.GetEncodedFrame();
-      if (!bufOpt) continue;
-      auto& buffer = *bufOpt;
+      if (bufOpt) {
+        auto& buffer = *bufOpt;
+        ConvertRGBAtoBGRA(buffer.data.data(), buffer.data.size());
+        renderer.SubmitFrame({buffer.frameIndex, buffer.desc, std::move(buffer.data)});
+      }
 
-      ConvertRGBAtoBGRA(buffer.data.data(), buffer.data.size());
-      renderer.SubmitFrame({0, buffer.desc, buffer.data});
+      auto now = std::chrono::steady_clock::now();
+      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - statsTime).count();
+      if (elapsed >= 1000) {
+        CaptureStats stats = capturer.GetStats();
+        const double seconds = elapsed / 1000.0;
+        std::cout << std::dec << "Unique Capture FPS: "
+                  << (stats.capturedFrames - previousStats.capturedFrames) / seconds
+                  << " | Duplicate frames: "
+                  << (stats.duplicateFrames - previousStats.duplicateFrames) << " | Readback FPS: "
+                  << (stats.readbackFrames - previousStats.readbackFrames) / seconds
+                  << " | Raw dropped: " << (stats.rawDroppedFrames - previousStats.rawDroppedFrames)
+                  << " | Output replaced: "
+                  << (stats.outputDroppedFrames - previousStats.outputDroppedFrames)
+                  << " | Capture interval P95/Max: " << stats.captureIntervalP95Ms << "/"
+                  << stats.captureIntervalMaxMs << " ms"
+                  << " | Samples: " << stats.captureIntervalSamples << std::endl;
+        previousStats = stats;
+        statsTime = now;
+      }
+
+      if (!bufOpt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
 
       // auto rawFrameOpt = capturer.DecodeQoiToFrame(buffer);
       // if (!rawFrameOpt) continue;

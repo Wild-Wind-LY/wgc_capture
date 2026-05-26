@@ -23,12 +23,11 @@
 #include <condition_variable>
 #include <iostream>
 #include <mutex>
-#include <queue>
+#include <optional>
 #include <vector>
 
 #include "lock_free_queue.hpp"
 
-constexpr size_t kMaxEncodingQueueSize = 2;
 constexpr size_t kMaxRawFrameQueueSize = 2;
 
 struct __declspec(uuid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1")) IDirect3DDxgiInterfaceAccess
@@ -58,6 +57,17 @@ struct EncodedFrame {   // 编码后数据
   std::vector<uint8_t> data;
 
   bool operator<(const EncodedFrame& other) const { return frameIndex > other.frameIndex; }
+};
+
+struct CaptureStats {
+  uint64_t capturedFrames = 0;
+  uint64_t duplicateFrames = 0;
+  uint64_t readbackFrames = 0;
+  uint64_t rawDroppedFrames = 0;
+  uint64_t outputDroppedFrames = 0;
+  double captureIntervalMaxMs = 0.0;
+  double captureIntervalP95Ms = 0.0;
+  uint64_t captureIntervalSamples = 0;
 };
 
 class WgcCore {
@@ -116,6 +126,8 @@ public:
   // 消耗一帧 PNG 格式图像数据
   auto GetEncodedFrame() -> std::optional<EncodedFrame>;
 
+  CaptureStats GetStats();
+
   // 将qoi编码的图像数据解码为RGBA原始像素数据
   auto DecodeQoiToFrame(const EncodedFrame& qoiBuffer) -> std::optional<FrameData>;
 
@@ -155,10 +167,17 @@ private:
   LockFreeFrameQueue<RawFrameData, kMaxRawFrameQueueSize> m_rawFrameQueue;
 
   std::mutex m_encodingMutex;
-  std::priority_queue<EncodedFrame> m_encodedQueue;
-  // LockFreeFrameQueue<EncodedFrame, kMaxEncodingQueueSize> m_encodedQueue;
+  std::optional<EncodedFrame> m_encodedFrame;
 
   size_t m_frameIndex = 0;
+  std::atomic<uint64_t> m_capturedFrames{0};
+  std::atomic<uint64_t> m_duplicateFrames{0};
+  std::atomic<uint64_t> m_readbackFrames{0};
+  std::atomic<uint64_t> m_rawDroppedFrames{0};
+  std::atomic<uint64_t> m_outputDroppedFrames{0};
+  std::mutex m_captureTimingMutex;
+  winrt::Windows::Foundation::TimeSpan m_lastCaptureTimestamp{};
+  std::vector<double> m_captureIntervalsMs;
 
   std::atomic_bool m_encodingThreadRunning{false};
   std::thread m_encodingThread;

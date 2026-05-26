@@ -13,9 +13,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "wgc_core.hpp"  // FrameData
@@ -33,7 +35,8 @@ public:
         frontIndex_(0),
         backIndex_(1),
         running_(false),
-        fpsFont_(nullptr) {
+        fpsFont_(nullptr),
+        lastRenderedFrameIndex_(std::numeric_limits<uint64_t>::max()) {
     frames_[0].rgbaData.clear();
     frames_[1].rgbaData.clear();
   }
@@ -41,9 +44,9 @@ public:
   ~FrameRenderer() { Stop(); }
 
   // 非阻塞提交最新帧
-  void SubmitFrame(const FrameData& frame) {
+  void SubmitFrame(FrameData frame) {
     int writeIndex = backIndex_.load(std::memory_order_relaxed);
-    frames_[writeIndex] = frame;  // 直接覆盖
+    frames_[writeIndex] = std::move(frame);  // 直接覆盖
 
     frontIndex_.store(writeIndex, std::memory_order_release);
     backIndex_.store(1 - writeIndex, std::memory_order_relaxed);
@@ -64,8 +67,10 @@ public:
 
     // 渲染最新帧
     int readIndex = frontIndex_.load(std::memory_order_acquire);
-    if (!frames_[readIndex].rgbaData.empty()) {
+    if (!frames_[readIndex].rgbaData.empty()
+        && frames_[readIndex].frameIndex != lastRenderedFrameIndex_) {
       RenderFrame(frames_[readIndex]);
+      lastRenderedFrameIndex_ = frames_[readIndex].frameIndex;
     }
 
     return true;
@@ -101,6 +106,7 @@ private:
   std::chrono::steady_clock::time_point lastTime_ = std::chrono::steady_clock::now();
   int frameCount_ = 0;
   float currentFps_ = 0.0f;
+  uint64_t lastRenderedFrameIndex_;
 
   FrameData frames_[2];
   std::atomic<int> frontIndex_;
@@ -214,7 +220,7 @@ private:
     HFONT oldFont = (HFONT)SelectObject(hdcMem_, fpsFont_);
     SetBkMode(hdcMem_, TRANSPARENT);
     SetTextColor(hdcMem_, RGB(255, 0, 0));
-    std::wstring fpsText = L"FPS:" + std::to_wstring(static_cast<int>(currentFps_));
+    std::wstring fpsText = L"Present FPS:" + std::to_wstring(static_cast<int>(currentFps_));
     RECT fpsRect = {10, 10, 200, 50};
     FillRect(hdcMem_, &fpsRect, (HBRUSH)GetStockObject(BLACK_BRUSH));
     TextOut(hdcMem_, 10, 10, fpsText.c_str(), (int)fpsText.size());
